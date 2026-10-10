@@ -1,0 +1,6 @@
+torch>=2.1
+monai>=1.4          # AutoencoderKL / DiffusionModelUNet / PatchDiscriminator live in monai.networks.nets since 1.4
+einops              # needed by MONAI attention blocks
+nibabel
+numpy
+pyyaml

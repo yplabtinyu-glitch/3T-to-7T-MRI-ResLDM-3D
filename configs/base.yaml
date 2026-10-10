@@ -1,0 +1,95 @@
+# 3T -> 7T latent diffusion, 3D. Every script takes --config this file; out_dir holds all checkpoints / logs / caches.
+out_dir: runs/base
+seed: 0
+bf16: true            # bf16 autocast on CUDA (H200 / A100); ignored on CPU
+num_workers: 8
+
+data:
+  pairs_csv: data/pairs.csv     # columns: subject, split (train/val/test), t3, t7   (3T already registered to the 7T grid)
+  data_dir: data                # prepare_data.py writes data/prepped/*.npy and data/hist_ref.npz here
+  pad_multiple: 32              # volumes are padded to a multiple of this (AE factor x UNet downsampling)
+  norm_pct: 99.5                # intensity: clip at this foreground percentile, scale to [0, 1]
+  brain_thr: 0.02               # foreground / brain mask threshold on [0, 1] images
+
+ae:
+  channels: [32, 64, 128, 128]  # 3 downsamplings -> 8x per axis (same factor as the 2D AE: 128^2 -> 16^2)
+  latent_channels: 4
+  num_res_blocks: 2
+  attention_levels: [false, false, false, false]
+  norm_num_groups: 32
+  use_checkpoint: true          # gradient checkpointing: needed when decoding with grad for image losses
+  train:
+    patch: 96
+    batch_size: 2               # 3T and 7T patches are stacked, so the real batch is 2x this
+    samples_per_epoch: 2000
+    val_samples: 200
+    epochs: 100
+    lr: 1.0e-4
+    kl_weight: 1.0e-6
+    adv_weight: 0.01            # 3D PatchGAN (LSGAN), 0 disables
+    adv_start_epoch: 10
+    adv_layers: 3               # PatchGAN depth; needs patch >= ~2^(layers+2)
+    patience: 15
+
+latent:
+  tile: 128                     # tiled encode / decode of whole volumes (image voxels); null = whole volume at once
+  overlap: 32
+
+spade:
+  num_classes: 2                # class 1 = 7T (same convention as the 2D SPADE)
+  nf: 64
+  train:
+    crop: 16                    # latent crop (16 latent = 128 image voxels)
+    batch_size: 4
+    samples_per_epoch: 2000
+    val_samples: 200
+    epochs: 60
+    lr: 1.0e-4
+    lambda_latent: 1.0          # L1 to the 7T latent
+    patience: 10
+  losses:                       # image-space losses (see mri3d/imageloss.py)
+    lambda_mind: 1.0            # MIND structure loss vs the same-subject 3T (the MIND-SPADE of the 2D pipeline)
+    brain_thr: 0.02
+    margin: 8
+    sub_crop: 12
+
+diffusion:
+  T: 4
+  p: 0.3
+  kappa: auto                   # auto = per-channel std(scaled zspade - scaled z7t) on the training cache, or a list
+  kappa_mult: 1.0
+  condition: 3t                 # none | 3t | spade | all
+  unet:
+    channels: [64, 128, 256]
+    attention_levels: [false, false, true]
+    num_res_blocks: 2
+    num_head_channels: 32
+  train:
+    crop: 16
+    batch_size: 8
+    samples_per_epoch: 4000
+    val_samples: 400
+    epochs: 60
+    lr: 1.0e-4
+    patience: 10
+    ckpt_every: 10
+    lambda_simple: 1.0          # weight of the latent MSE
+    compile: false              # torch.compile(mode="reduce-overhead"): CUDA graphs against CPU launch overhead
+  losses:
+    lambda_mind: 1.0            # structure vs the same-subject 3T
+    lambda_lf: 3.0              # low-frequency intensity vs SPADE
+    lf_factor: 8
+    lambda_corr: 0.0            # RegGAN-style registration-corrected L1 vs 7T (p5 of the 2D pipeline); 0 = off
+    corr_smooth: 1.0
+    corr_max_disp: 4.0
+    brain_thr: 0.02
+    margin: 8
+    sub_crop: 12
+
+infer:
+  split: test
+  hist_match: both              # none | 3t | both
+  latent_tile: null             # null = whole latent volume in one UNet pass; or an int (latent voxels)
+  latent_overlap: 4
+  seed: 0
+  save_nifti: true

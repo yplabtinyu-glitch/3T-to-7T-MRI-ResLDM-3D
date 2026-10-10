@@ -1,0 +1,5 @@
+subject,split,t3,t7
+sub001,train,/data/registered/sub001_3T_to_7T.nii.gz,/data/7T/sub001_7T.nii.gz
+sub002,train,/data/registered/sub002_3T_to_7T.nii.gz,/data/7T/sub002_7T.nii.gz
+sub101,val,/data/registered/sub101_3T_to_7T.nii.gz,/data/7T/sub101_7T.nii.gz
+212730,test,/data/test/3T/212730_to_7T.nii.gz,/data/test/7T/212730.nii.gz

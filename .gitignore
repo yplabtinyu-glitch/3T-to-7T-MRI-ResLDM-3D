@@ -1,0 +1,14 @@
+# data and outputs are never committed
+data/*
+!data/pairs_example.csv
+runs/
+*.pth
+*.npy
+*.npz
+*.nii
+*.nii.gz
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.vscode/
+.DS_Store
