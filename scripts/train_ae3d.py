@@ -1,5 +1,7 @@
 """Stage 1: shared 3D AutoencoderKL for 3T and 7T, trained on 64^3 patches drawn from a stride-16 grid.
-loss = L1 + kl_weight * KL (optional 3D PatchGAN if adv_weight > 0; off by default). One CSV row per epoch.
+Masked AE: during training a random mask_ratio of the 8^3 blocks of each input patch is set to background (-1);
+the AE must reconstruct the full, unmasked patch. Validation, latent caching and inference use unmasked input.
+loss = L1(recon, unmasked patch) + kl_weight * KL (optional 3D PatchGAN if adv_weight > 0; off by default). One CSV row per epoch.
 usage: python scripts/train_ae3d.py --config configs/base.yaml [--resume]"""
 import argparse
 import os
@@ -11,7 +13,7 @@ import torch.nn.functional as F  # noqa: E402
 from monai.networks.nets import PatchDiscriminator  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
-from mri3d.data import PatchDataset, Prepped  # noqa: E402
+from mri3d.data import PatchDataset, Prepped, random_block_mask  # noqa: E402
 from mri3d.nets import build_ae  # noqa: E402
 from mri3d.utils import EpochLog, Meter, autocast, device_of, load_config, save_ckpt, seed_all  # noqa: E402
 
@@ -46,6 +48,8 @@ def main():
     if use_adv:
         disc = PatchDiscriminator(spatial_dims=3, channels=32, in_channels=1, num_layers_d=t.get("adv_layers", 3)).to(dev)
         opt_d = torch.optim.AdamW(disc.parameters(), lr=t["lr"])
+    mratio, mblock = t.get("mask_ratio", 0.0), t.get("mask_block", 8)
+    print(f"AE input masking: {mratio:.0%} of {mblock}^3 blocks per patch (training only)" if mratio > 0 else "AE input masking: off")
     print(f"AE params: {sum(p.numel() for p in ae.parameters()) / 1e6:.1f} M | device {dev}")
 
     start, best, bad = 0, float("inf"), 0
@@ -64,8 +68,9 @@ def main():
         adv_on = use_adv and ep >= t.get("adv_start_epoch", 0)
         for x3, x7 in tr:
             x = torch.cat([x3, x7]).to(dev, non_blocking=True)
+            xin, _ = random_block_mask(x, mblock, mratio)                # target stays the unmasked x
             with autocast(dev, cfg["bf16"]):
-                rec, mu, sigma = ae(x)
+                rec, mu, sigma = ae(xin)
                 l1 = F.l1_loss(rec.float(), x)
                 kl = kl_loss(mu.float(), sigma.float())
                 loss = l1 + t["kl_weight"] * kl

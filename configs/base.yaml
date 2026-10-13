@@ -28,6 +28,8 @@ ae:
     epochs: 100
     lr: 1.0e-4
     kl_weight: 1.0e-6
+    mask_ratio: 0.25            # masked AE: fraction of 8^3 blocks per input patch set to background (training only; 0 = off)
+    mask_block: 8               # block size in voxels = one latent voxel (64 / 8)
     adv_weight: 0.0             # optional 3D PatchGAN (LSGAN); off -- AE loss is L1 + KL
     adv_start_epoch: 10
     adv_layers: 3               # PatchGAN depth; needs patch >= ~2^(layers+2)

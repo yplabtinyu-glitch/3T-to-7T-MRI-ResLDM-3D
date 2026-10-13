@@ -108,6 +108,25 @@ class PatchMerger:
         return self.sum / self.cnt
 
 
+def random_block_mask(x, block, ratio, value=-1.0, generator=None):
+    """masked-AE input: split each (B,C,D,H,W) patch into block^3 cubes and set a random `ratio` of them to `value`
+    (background). Each sample gets its own mask; returns (masked x, keep mask (B,1,D,H,W) with 1 = visible)."""
+    if ratio <= 0:
+        return x, torch.ones_like(x[:, :1])
+    B, _, D, H, W = x.shape
+    if D % block or H % block or W % block:
+        raise ValueError(f"patch {tuple(x.shape[2:])} is not divisible by mask block {block}")
+    g = (D // block, H // block, W // block)
+    n = g[0] * g[1] * g[2]
+    k = int(round(ratio * n))
+    score = torch.rand(B, n, generator=generator, device=x.device)
+    keep = torch.ones(B, n, device=x.device)
+    keep.scatter_(1, score.argsort(1)[:, :k], 0.0)                       # exactly k hidden blocks per sample
+    keep = keep.view(B, 1, *g)
+    keep = keep.repeat_interleave(block, 2).repeat_interleave(block, 3).repeat_interleave(block, 4)
+    return x * keep + value * (1 - keep), keep
+
+
 # ----------------------------------------------------------------------------- prepared data
 class Prepped:
     """Reads data_dir/prepped/meta.json written by scripts/prepare_data.py."""

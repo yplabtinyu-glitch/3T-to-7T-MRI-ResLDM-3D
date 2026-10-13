@@ -20,7 +20,7 @@ all patches (stride 32) ──► mean of overlapping voxels ──► unpad ─
 
 | stage | network | training data | loss |
 |---|---|---|---|
-| 1. AE | MONAI `AutoencoderKL`, 3D, 8x per axis, 4 latent channels | 64³ patches of 3T and 7T from a stride-16 grid | L1 + KL |
+| 1. AE | MONAI `AutoencoderKL`, 3D, 8x per axis, 4 latent channels | 64³ patches of 3T and 7T from a stride-16 grid, 25 % of 8³ blocks masked | L1(recon, unmasked patch) + KL |
 | 2. SPADE | 3D SPADE generator (ported from ALDM) | cached 4×8³ latents of 64³ patches (stride-32 grid) | latent L1 to z_7T + MIND(D(SPADE), D(z_3T)) |
 | 3. ResShift | MONAI `DiffusionModelUNet`, 3D | cached 4×8³ latents of 64³ patches (stride-32 grid) | latent MSE + MIND vs 3T + low-frequency L1 vs SPADE (+ optional registration-corrected L1 vs 7T) |
 
@@ -94,6 +94,7 @@ The defaults are a starting point for an 80–141 GB GPU; **they have not yet be
 | `ae.train.stride` (16) | grid of AE training patches (denser grid = more distinct patches) |
 | `latent.stride` (32) | grid of the cached latent patches used by SPADE / ResShift training |
 | `infer.stride` (32), `infer.batch`, `infer.merge: mean` | inference grid, patches per forward pass, overlap averaging |
+| `ae.train.mask_ratio` (0.25), `ae.train.mask_block` (8) | masked AE: fraction of 8³ blocks of each training input set to background; target is the full patch. Training only; 0 = off |
 | `ae.train.batch_size` | AE activation memory |
 | `ae.use_checkpoint` | gradient checkpointing in the AE; needed for the image-space losses of stages 2–3 |
 | `*.losses.sub_crop` | `null` = image losses on the whole decoded 64³ patch; an int restricts them to a latent sub-crop |
@@ -109,6 +110,9 @@ The defaults are a starting point for an 80–141 GB GPU; **they have not yet be
    Each patch gets its own diffusion noise, so the mean also averages over samples.
 2. **Image-space losses on decoded patches.** MIND / LF / registration losses decode the predicted latent through the
    frozen decoder with gradient. Patch borders are excluded (`margin`) because decoded patches have edge artefacts.
+2c. **Masked AE.** Stage 1 hides 25 % of the 8³ blocks (one latent voxel each) of every training input and
+   reconstructs the full patch. Validation, the latent cache and inference never mask. The ratio 0.25 is a starting
+   value, not tuned.
 2b. **Foreground sampling.** Training patches are drawn from the grid with `fg_bias` probability from patches whose
    brain fraction is > 5 %, so mostly-background corners of the padded volume are rarely used.
 3. **Latent cache.** AE and SPADE are frozen, so their outputs are cached once; diffusion training reads only

@@ -14,7 +14,7 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 import yaml  # noqa: E402
 
-from mri3d.data import PatchMerger, extract_patches, grid_corners, hist_match, landmarks, pad_for_patches, unpad  # noqa: E402
+from mri3d.data import PatchMerger, extract_patches, grid_corners, hist_match, landmarks, pad_for_patches, random_block_mask, unpad  # noqa: E402
 from mri3d.losses import mind3d, warp3d  # noqa: E402
 from mri3d.resshift3d import ResShift3D  # noqa: E402
 
@@ -42,6 +42,14 @@ def unit_tests():
         check("grid_corners rejects a misfit shape", False)
     except ValueError:
         check("grid_corners rejects a misfit shape", True)
+    # masked-AE input: exactly ratio of the blocks hidden, set to -1, visible voxels untouched, masks differ per sample
+    xb = torch.rand(3, 1, 64, 64, 64)
+    xm, keep = random_block_mask(xb, 8, 0.25)
+    hidden = 1 - keep[:, 0, ::8, ::8, ::8]
+    ok = (hidden.flatten(1).sum(1) == 128).all() and torch.equal(xm[keep.expand_as(xm) == 0], torch.full_like(xm[keep.expand_as(xm) == 0], -1.0)) \
+        and torch.equal(xm[keep.expand_as(xm) == 1], xb[keep.expand_as(xb) == 1]) and not torch.equal(keep[0], keep[1])
+    blocky = torch.equal(keep, hidden.neg().add(1)[:, None].repeat_interleave(8, 2).repeat_interleave(8, 3).repeat_interleave(8, 4))
+    check("random_block_mask (25 % of 8^3 blocks)", bool(ok and blocky), f"(hidden blocks per sample {hidden.flatten(1).sum(1).tolist()} / 512)")
     # warp: zero displacement = identity; integer shift is undone
     img = torch.rand(1, 1, 20, 24, 28)
     check("warp3d identity", torch.allclose(warp3d(img, torch.zeros(1, 3, 20, 24, 28)), img, atol=1e-5))
@@ -93,7 +101,7 @@ def tiny_config(root):
     cfg.update(out_dir=os.path.join(root, "runs"), num_workers=0, bf16=False)
     cfg["data"].update(pairs_csv=os.path.join(root, "pairs.csv"), data_dir=root, patch=16, pad_stride=8)
     cfg["ae"].update(channels=[8, 16, 16], attention_levels=[False, False, False], norm_num_groups=8, use_checkpoint=False)
-    cfg["ae"]["train"].update(patch=16, stride=8, batch_size=2, samples_per_epoch=4, val_samples=2, epochs=2)
+    cfg["ae"]["train"].update(patch=16, stride=8, mask_block=4, batch_size=2, samples_per_epoch=4, val_samples=2, epochs=2)
     cfg["latent"].update(stride=8, batch=8)
     cfg["spade"]["nf"] = 8
     cfg["spade"]["train"].update(batch_size=2, samples_per_epoch=4, val_samples=2, epochs=2)
