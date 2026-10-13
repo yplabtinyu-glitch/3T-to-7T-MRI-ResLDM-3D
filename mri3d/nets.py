@@ -1,4 +1,4 @@
-"""Network builders (MONAI AutoencoderKL / DiffusionModelUNet, 3D) and tiled encode / decode for whole volumes."""
+"""Network builders (MONAI AutoencoderKL / DiffusionModelUNet, 3D). `tiled` is kept as a utility; the pipeline itself works on 64^3 patches (see mri3d/data.py)."""
 import itertools
 
 import torch

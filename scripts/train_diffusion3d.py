@@ -1,4 +1,4 @@
-"""Stage 3: ResShift latent diffusion in 3D on cached latent crops (AE and SPADE frozen, read from the cache).
+"""Stage 3: ResShift latent diffusion in 3D on cached per-patch latents (AE and SPADE frozen, read from the cache).
 loss = lambda_simple * MSE(x0_hat, x0) + image losses (MIND vs 3T, LF vs SPADE, optional registration-corrected L1 vs 7T).
 usage: python scripts/train_diffusion3d.py --config configs/base.yaml [--name p4_mindlf] [--resume]"""
 import argparse
@@ -11,7 +11,7 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
-from mri3d.data import LatentCropDataset, Prepped  # noqa: E402
+from mri3d.data import LatentPatchDataset, Prepped  # noqa: E402
 from mri3d.imageloss import ImageLosses  # noqa: E402
 from mri3d.nets import build_unet, load_ae  # noqa: E402
 from mri3d.resshift3d import CONDITIONS, ResShift3D  # noqa: E402
@@ -65,10 +65,10 @@ def main():
     pr = Prepped(cfg["data"]["data_dir"])
 
     keys = ["z3t", "z7t", "zspade"]
-    tr = DataLoader(LatentCropDataset(cdir, pr.subjects("train"), keys, t["crop"], t["samples_per_epoch"]),
+    tr = DataLoader(LatentPatchDataset(cdir, pr.subjects("train"), keys, t["samples_per_epoch"]),
                     batch_size=t["batch_size"], num_workers=cfg["num_workers"], drop_last=True,
                     persistent_workers=cfg["num_workers"] > 0)
-    va = DataLoader(LatentCropDataset(cdir, pr.subjects("val"), keys, t["crop"], t["val_samples"], seed=999),
+    va = DataLoader(LatentPatchDataset(cdir, pr.subjects("val"), keys, t["val_samples"], seed=999),
                     batch_size=t["batch_size"], num_workers=cfg["num_workers"])
 
     model = build_model(cfg, kappa).to(dev)

@@ -1,5 +1,5 @@
-"""Stage 1: shared 3D AutoencoderKL for 3T and 7T, trained on random 3D patches.
-loss = L1 + kl_weight * KL (+ adv_weight * 3D PatchGAN after adv_start_epoch). One CSV row per epoch.
+"""Stage 1: shared 3D AutoencoderKL for 3T and 7T, trained on 64^3 patches drawn from a stride-16 grid.
+loss = L1 + kl_weight * KL (optional 3D PatchGAN if adv_weight > 0; off by default). One CSV row per epoch.
 usage: python scripts/train_ae3d.py --config configs/base.yaml [--resume]"""
 import argparse
 import os
@@ -33,9 +33,11 @@ def main():
     os.makedirs(out, exist_ok=True)
 
     pr = Prepped(cfg["data"]["data_dir"])
-    tr = DataLoader(PatchDataset(pr, "train", t["patch"], t["samples_per_epoch"]), batch_size=t["batch_size"],
+    if t["patch"] != cfg["data"]["patch"]:
+        sys.exit(f"ae.train.patch={t['patch']} must equal data.patch={cfg['data']['patch']}")
+    tr = DataLoader(PatchDataset(pr, "train", t["patch"], t["stride"], t["samples_per_epoch"]), batch_size=t["batch_size"],
                     shuffle=False, num_workers=cfg["num_workers"], drop_last=True, persistent_workers=cfg["num_workers"] > 0)
-    va = DataLoader(PatchDataset(pr, "val", t["patch"], t["val_samples"], seed=1234), batch_size=t["batch_size"],
+    va = DataLoader(PatchDataset(pr, "val", t["patch"], t["stride"], t["val_samples"], seed=1234), batch_size=t["batch_size"],
                     num_workers=cfg["num_workers"])
 
     ae = build_ae(c).to(dev)

@@ -1,4 +1,6 @@
-"""Normalise + pad every volume once, save as float16 .npy in [-1, 1], and build the histogram-matching reference.
+"""Normalise + zero-pad every volume once, save as float16 .npy in [-1, 1], and build the histogram-matching reference.
+Padding: symmetric, value 0 in [0, 1] (= -1 stored), so that size >= patch and (size - patch) % pad_stride == 0 on every axis
+-> the AE grid (ae.train.stride) and the inference / latent grid (infer.stride) both tile the volume exactly.
 usage: python scripts/prepare_data.py --config configs/base.yaml"""
 import argparse
 import json
@@ -8,7 +10,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np  # noqa: E402
 
-from mri3d.data import landmarks, load_nifti, normalize01, pad_to_multiple, read_pairs  # noqa: E402
+from mri3d.data import landmarks, load_nifti, normalize01, pad_for_patches, read_pairs  # noqa: E402
 from mri3d.utils import load_config  # noqa: E402
 
 
@@ -19,7 +21,11 @@ def main():
     d = cfg["data"]
     out = os.path.join(d["data_dir"], "prepped")
     os.makedirs(out, exist_ok=True)
-    meta = {"pad_multiple": d["pad_multiple"], "norm_pct": d["norm_pct"], "subjects": {}}
+    P, S = d["patch"], d["pad_stride"]
+    for k, st in (("ae.train.stride", cfg["ae"]["train"]["stride"]), ("latent.stride", cfg["latent"]["stride"]), ("infer.stride", cfg["infer"]["stride"])):
+        if S % st:
+            sys.exit(f"data.pad_stride={S} must be a multiple of {k}={st} so that grid fits the padded volume")
+    meta = {"patch": P, "pad_stride": S, "norm_pct": d["norm_pct"], "subjects": {}}
     lms = {"3t": [], "7t": []}
     for r in read_pairs(d["pairs_csv"]):
         vols = {}
@@ -28,7 +34,7 @@ def main():
             v01 = normalize01(v, d["norm_pct"])
             if r["split"] == "train":
                 lms[mod].append(landmarks(v01, d["brain_thr"]))
-            vp, pads = pad_to_multiple(v01 * 2 - 1, d["pad_multiple"], -1.0)
+            vp, pads = pad_for_patches(v01 * 2 - 1, P, S, -1.0)
             np.save(os.path.join(out, f"{r['subject']}_{mod}.npy"), vp.astype(np.float16))
             vols[mod] = (v.shape, pads)
         if vols["3t"][0] != vols["7t"][0]:

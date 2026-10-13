@@ -14,9 +14,8 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 import yaml  # noqa: E402
 
-from mri3d.data import hist_match, landmarks  # noqa: E402
+from mri3d.data import PatchMerger, extract_patches, grid_corners, hist_match, landmarks, pad_for_patches, unpad  # noqa: E402
 from mri3d.losses import mind3d, warp3d  # noqa: E402
-from mri3d.nets import tiled  # noqa: E402
 from mri3d.resshift3d import ResShift3D  # noqa: E402
 
 
@@ -28,18 +27,21 @@ def check(name, ok, detail=""):
 
 def unit_tests():
     torch.manual_seed(0)
-    # tiled processing == whole-volume processing when overlap >= receptive field
-    enc = torch.nn.Sequential(torch.nn.Conv3d(1, 4, 3, padding=1), torch.nn.Conv3d(4, 4, 3, padding=1), torch.nn.AvgPool3d(4)).eval()
-    x = torch.randn(1, 1, 48, 64, 40)
-    with torch.no_grad():
-        full = enc(x)
-    t = tiled(enc, x, 32, 8, 1 / 4, 4)
-    check("tiled encode == whole volume", torch.allclose(full, t, atol=1e-5), f"(max diff {(full - t).abs().max():.2e})")
-    dec = torch.nn.Sequential(torch.nn.Upsample(scale_factor=4), torch.nn.Conv3d(4, 1, 3, padding=1)).eval()
-    with torch.no_grad():
-        full = dec(t)
-    t2 = tiled(dec, t, 8, 2, 4, 1)
-    check("tiled decode == whole volume", torch.allclose(full, t2, atol=1e-5), f"(max diff {(full - t2).abs().max():.2e})")
+    # padding + patch grid: every voxel covered; merging identical patches gives back the volume
+    v = np.random.default_rng(0).random((40, 48, 36)).astype(np.float32)
+    vp, pads = pad_for_patches(v, 16, 8, -1.0)
+    check("pad_for_patches fits the grid", all((s_ - 16) % 8 == 0 for s_ in vp.shape) and np.array_equal(unpad(vp, pads), v), str(vp.shape))
+    check("padding is constant -1", pads[2] == (2, 2) and np.all(vp[..., :2] == -1.0) and np.all(vp[..., -2:] == -1.0), str(pads))
+    cs = grid_corners(vp.shape, 16, 8)
+    vt = torch.from_numpy(vp)[None]
+    m = PatchMerger(vp.shape, 16, "cpu")
+    m.add(extract_patches(vt, cs, 16), cs)
+    check("patch extract + mean merge == identity", torch.allclose(m.result()[0], torch.from_numpy(vp)), f"({len(cs)} patches)")
+    try:
+        grid_corners((41, 48, 36), 16, 8)
+        check("grid_corners rejects a misfit shape", False)
+    except ValueError:
+        check("grid_corners rejects a misfit shape", True)
     # warp: zero displacement = identity; integer shift is undone
     img = torch.rand(1, 1, 20, 24, 28)
     check("warp3d identity", torch.allclose(warp3d(img, torch.zeros(1, 3, 20, 24, 28)), img, atol=1e-5))
@@ -86,20 +88,21 @@ def make_data(root, n=4, shape=(40, 48, 36)):
 
 
 def tiny_config(root):
+    """same structure as base.yaml, scaled down: 16^3 patches, AE factor 4 (4^3 latent), all strides 8"""
     cfg = yaml.safe_load(open(os.path.join(ROOT, "configs", "base.yaml")))
     cfg.update(out_dir=os.path.join(root, "runs"), num_workers=0, bf16=False)
-    cfg["data"].update(pairs_csv=os.path.join(root, "pairs.csv"), data_dir=root, pad_multiple=16)
+    cfg["data"].update(pairs_csv=os.path.join(root, "pairs.csv"), data_dir=root, patch=16, pad_stride=8)
     cfg["ae"].update(channels=[8, 16, 16], attention_levels=[False, False, False], norm_num_groups=8, use_checkpoint=False)
-    cfg["ae"]["train"].update(patch=32, adv_layers=2, batch_size=2, samples_per_epoch=4, val_samples=2, epochs=2, adv_start_epoch=1)
-    cfg["latent"].update(tile=32, overlap=8)
+    cfg["ae"]["train"].update(patch=16, stride=8, batch_size=2, samples_per_epoch=4, val_samples=2, epochs=2)
+    cfg["latent"].update(stride=8, batch=8)
     cfg["spade"]["nf"] = 8
-    cfg["spade"]["train"].update(crop=8, batch_size=2, samples_per_epoch=4, val_samples=2, epochs=2)
-    cfg["spade"]["losses"].update(margin=2, sub_crop=6)
+    cfg["spade"]["train"].update(batch_size=2, samples_per_epoch=4, val_samples=2, epochs=2)
+    cfg["spade"]["losses"].update(margin=2)
     cfg["diffusion"]["condition"] = "all"
     cfg["diffusion"]["unet"].update(channels=[16, 16, 32], attention_levels=[False, False, True], norm_num_groups=8, num_head_channels=8)
-    cfg["diffusion"]["train"].update(crop=8, batch_size=2, samples_per_epoch=4, val_samples=2, epochs=2, ckpt_every=1)
-    cfg["diffusion"]["losses"].update(lambda_corr=1.0, margin=2, sub_crop=6, lf_factor=4)
-    cfg["infer"].update(latent_tile=8, latent_overlap=2)
+    cfg["diffusion"]["train"].update(batch_size=2, samples_per_epoch=4, val_samples=2, epochs=2, ckpt_every=1)
+    cfg["diffusion"]["losses"].update(lambda_corr=1.0, margin=2, lf_factor=4)
+    cfg["infer"].update(stride=8, batch=8)
     p = os.path.join(root, "tiny.yaml")
     yaml.safe_dump(cfg, open(p, "w"))
     return p, cfg

@@ -1,4 +1,4 @@
-"""Stage 2: 3D SPADE on cached latent crops. loss = lambda_latent * L1(SPADE(z3t), z7t) + lambda_mind * MIND(D(SPADE(z3t)), D(z3t)).
+"""Stage 2: 3D SPADE on cached per-patch latents (8^3 x 4 = one 64^3 patch). loss = lambda_latent * L1(SPADE(z3t), z7t) + lambda_mind * MIND(D(SPADE(z3t)), D(z3t)).
 usage: python scripts/train_spade3d.py --config configs/base.yaml [--resume]"""
 import argparse
 import json
@@ -10,7 +10,7 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from torch.utils.data import DataLoader  # noqa: E402
 
-from mri3d.data import LatentCropDataset, Prepped  # noqa: E402
+from mri3d.data import LatentPatchDataset, Prepped  # noqa: E402
 from mri3d.imageloss import ImageLosses  # noqa: E402
 from mri3d.nets import load_ae  # noqa: E402
 from mri3d.spade3d import SPADEGenerator3D  # noqa: E402
@@ -43,9 +43,9 @@ def main():
     pr = Prepped(cfg["data"]["data_dir"])
 
     keys = ["z3t", "z7t"]
-    tr = DataLoader(LatentCropDataset(cdir, pr.subjects("train"), keys, t["crop"], t["samples_per_epoch"]),
+    tr = DataLoader(LatentPatchDataset(cdir, pr.subjects("train"), keys, t["samples_per_epoch"]),
                     batch_size=t["batch_size"], num_workers=cfg["num_workers"], drop_last=True)
-    va = DataLoader(LatentCropDataset(cdir, pr.subjects("val"), keys, t["crop"], t["val_samples"], seed=4321),
+    va = DataLoader(LatentPatchDataset(cdir, pr.subjects("val"), keys, t["val_samples"], seed=4321),
                     batch_size=t["batch_size"], num_workers=cfg["num_workers"])
     ae = load_ae(cfg, meta["ae_ckpt"], dev)
     sp = SPADEGenerator3D(cfg["spade"]["num_classes"], cfg["ae"]["latent_channels"], cfg["spade"]["nf"]).to(dev)

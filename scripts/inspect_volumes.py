@@ -25,8 +25,8 @@ def main():
         bad += not same
         print(f"{r['subject']:>12} {r['split']:>5}  {str(v3.shape):>16} {str(v7.shape):>16}  {str(tuple(round(float(z), 2) for z in z7)):>20}  "
               f"{v3.max():8.1f} {v7.max():8.1f}{'' if same else '   <-- 3T and 7T grids differ'}")
-    m = cfg["data"]["pad_multiple"]
-    print(f"\n{len(rows)} pairs; {bad} with mismatched grids. Volumes will be padded to multiples of {m}.")
+    P, S = cfg["data"]["patch"], cfg["data"]["pad_stride"]
+    print(f"\n{len(rows)} pairs; {bad} with mismatched grids. Volumes will be zero-padded so that {P}^3 patches tile them with stride {S}.")
     if bad:
         sys.exit("register the 3T onto the 7T grid first (the pipeline assumes voxel-aligned pairs)")
 

@@ -5,16 +5,24 @@ Full-3D version of the unpaired 3T→7T brain MRI synthesis pipeline in
 Same three stages and the same losses, but every network works on 3D volumes, which removes the
 slice-to-slice inconsistency of the 2D model.
 
+Everything runs on **64³ patches**. Each volume is zero-padded (constant background, −1 in the [−1, 1] range)
+so that a stride grid of 64³ windows covers it exactly. The AE trains on patches from a **stride-16** grid;
+inference cuts the padded 3T volume on a **stride-32** grid, runs every patch through the whole pipeline,
+and averages the overlapping outputs voxel-wise before removing the padding.
+
 ```
-3T volume ──► 3D AE encoder ──► z_3T ──► 3D SPADE ──► y0 = z_SPADE ──► 3D ResShift UNet (T steps) ──► 3D AE decoder ──► synthetic 7T
+per 64³ patch:
+3T patch ──► 3D AE encoder ──► z_3T ──► 3D SPADE ──► y0 = z_SPADE ──► 3D ResShift UNet (T steps) ──► 3D AE decoder ──► 7T patch
+  (64³)       (frozen)       (4×8³)     (frozen)                       condition: z_3T / z_SPADE / both / none     (frozen)    (64³)
+all patches (stride 32) ──► mean of overlapping voxels ──► unpad ──► synthetic 7T volume ──► z_3T ──► 3D SPADE ──► y0 = z_SPADE ──► 3D ResShift UNet (T steps) ──► 3D AE decoder ──► synthetic 7T
                 (frozen)                  (frozen)                       condition: z_3T / z_SPADE / both / none     (frozen)
 ```
 
 | stage | network | training data | loss |
 |---|---|---|---|
-| 1. AE | MONAI `AutoencoderKL`, 3D, 8x per axis, 4 latent channels | random 3D patches of 3T and 7T | L1 + KL (+ 3D PatchGAN) |
-| 2. SPADE | 3D SPADE generator (ported from ALDM) | random crops of cached latents | latent L1 to z_7T + MIND(D(SPADE), D(z_3T)) |
-| 3. ResShift | MONAI `DiffusionModelUNet`, 3D | random crops of cached latents | latent MSE + MIND vs 3T + low-frequency L1 vs SPADE (+ optional registration-corrected L1 vs 7T) |
+| 1. AE | MONAI `AutoencoderKL`, 3D, 8x per axis, 4 latent channels | 64³ patches of 3T and 7T from a stride-16 grid | L1 + KL |
+| 2. SPADE | 3D SPADE generator (ported from ALDM) | cached 4×8³ latents of 64³ patches (stride-32 grid) | latent L1 to z_7T + MIND(D(SPADE), D(z_3T)) |
+| 3. ResShift | MONAI `DiffusionModelUNet`, 3D | cached 4×8³ latents of 64³ patches (stride-32 grid) | latent MSE + MIND vs 3T + low-frequency L1 vs SPADE (+ optional registration-corrected L1 vs 7T) |
 
 What is carried over from the 2D pipeline unchanged: the ResShift schedule and sampler (checked numerically
 against the 2D code in the smoke test), `y0 = SPADE latent`, per-channel kappa from `std(z_SPADE − z_7T)`,
@@ -50,9 +58,9 @@ sub001,train,/path/sub001_3T_to7T.nii.gz,/path/sub001_7T.nii.gz
 ```bash
 C=configs/base.yaml
 python scripts/inspect_volumes.py   --config $C                  # shapes, spacing, grid check
-python scripts/prepare_data.py      --config $C                  # normalise + pad -> data/prepped/*.npy, data/hist_ref.npz
+python scripts/prepare_data.py      --config $C                  # normalise + zero-pad to the patch grid -> data/prepped/*.npy, data/hist_ref.npz
 python scripts/train_ae3d.py        --config $C                  # -> runs/base/ae/ae_best.pth
-python scripts/cache_latents3d.py   --config $C --stage ae       # -> runs/base/latents/*_z3t.npy, *_z7t.npy, scale
+python scripts/cache_latents3d.py   --config $C --stage ae       # -> runs/base/latents/*_z3t.npy, *_z7t.npy (per patch), *_corners.npy, *_fg.npy, scale
 python scripts/train_spade3d.py     --config $C                  # -> runs/base/spade/spade_best.pth
 python scripts/cache_latents3d.py   --config $C --stage spade    # -> runs/base/latents/*_zspade.npy, kappa_auto
 python scripts/train_diffusion3d.py --config $C --name p4_mindlf # -> runs/base/p4_mindlf/best.pth
@@ -82,39 +90,44 @@ The defaults are a starting point for an 80–141 GB GPU; **they have not yet be
 
 | knob | effect |
 |---|---|
-| `ae.train.patch`, `ae.train.batch_size` | AE activation memory (3D patches scale with patch³) |
+| `data.patch` (64), `data.pad_stride` (32) | patch size everywhere; volumes are zero-padded so a `pad_stride` grid fits exactly. `pad_stride` must be divisible by every stride below |
+| `ae.train.stride` (16) | grid of AE training patches (denser grid = more distinct patches) |
+| `latent.stride` (32) | grid of the cached latent patches used by SPADE / ResShift training |
+| `infer.stride` (32), `infer.batch`, `infer.merge: mean` | inference grid, patches per forward pass, overlap averaging |
+| `ae.train.batch_size` | AE activation memory |
 | `ae.use_checkpoint` | gradient checkpointing in the AE; needed for the image-space losses of stages 2–3 |
-| `*.losses.sub_crop` | image losses are computed on a `sub_crop³` latent sub-crop (12 latent = 96³ voxels) |
-| `latent.tile` / `latent.overlap` | tiled encode / decode of whole volumes (exact when overlap ≥ receptive field) |
-| `infer.latent_tile` | run the UNet on latent tiles instead of the whole latent volume |
+| `*.losses.sub_crop` | `null` = image losses on the whole decoded 64³ patch; an int restricts them to a latent sub-crop |
+| `ae.train.adv_weight` | optional 3D PatchGAN; **0 = off (default)** |
 | `diffusion.train.compile` | `torch.compile(mode="reduce-overhead")` (CUDA graphs) against CPU launch overhead — untested |
 | `bf16` | bf16 autocast on CUDA |
 
 ## For reviewers — design choices worth checking
 
-1. **Patch-based training, whole-volume inference.** The AE trains on 96³ patches, SPADE / diffusion on 16³ latent
-   crops (128³ voxels); inference encodes / decodes the whole volume in overlapping tiles and runs the UNet on the
-   whole latent volume (attention only at the deepest level). Is this train/test size mismatch acceptable, or
-   should inference also be tiled?
-2. **Image-space losses on decoded crops.** MIND / LF / registration losses decode the predicted latent through the
-   frozen decoder with gradient. Crop borders are excluded (`margin`) because decoded crops have edge artefacts.
+1. **Patch-based training and inference, same size.** Every stage sees 64³ patches (8³ latents), so train and test
+   inputs match. Inference uses a stride-32 grid (50 % overlap per axis, each interior voxel covered by 8 patches)
+   and a plain mean; a Gaussian-weighted merge would down-weight patch borders and is not implemented.
+   Each patch gets its own diffusion noise, so the mean also averages over samples.
+2. **Image-space losses on decoded patches.** MIND / LF / registration losses decode the predicted latent through the
+   frozen decoder with gradient. Patch borders are excluded (`margin`) because decoded patches have edge artefacts.
+2b. **Foreground sampling.** Training patches are drawn from the grid with `fg_bias` probability from patches whose
+   brain fraction is > 5 %, so mostly-background corners of the padded volume are rarely used.
 3. **Latent cache.** AE and SPADE are frozen, so their outputs are cached once; diffusion training reads only
    latents (the training-side acceleration of the 2D pipeline, now also for SPADE).
 4. **Scale factor.** `scale = 1 / std(z_7T)` over the training set, applied before diffusion; kappa is measured on
    the scaled latents.
-5. **Data volume.** 3D training sees one sample per subject per crop; with few subjects the AE may need strong
+5. **Data volume.** 3D training sees far fewer independent samples than slice-wise 2D; with few subjects the AE may need strong
    augmentation (none implemented yet).
 
 ## Repository layout
 
 ```
 mri3d/
-  data.py        pair list, NIfTI I/O, normalisation, Nyúl histogram matching, padding, patch / latent-crop datasets
-  nets.py        MONAI AE / UNet builders, posterior-mean encode, tiled whole-volume processing
+  data.py        pair list, NIfTI I/O, normalisation, Nyúl histogram matching, zero padding, patch grid / merger, patch datasets
+  nets.py        MONAI AE / UNet builders, posterior-mean encode
   spade3d.py     3D SPADE generator (from ALDM)
   resshift3d.py  ResShift schedule, forward process, sampler, conditioning
   losses.py      3D MIND, low-frequency L1, registration net + warp, SSIM
-  imageloss.py   image-space losses on decoded latent crops
+  imageloss.py   image-space losses on decoded latent patches
   utils.py       config, seeding, per-epoch CSV log, bf16 autocast, checkpoints
 scripts/         inspect / prepare / train_ae3d / cache_latents3d / train_spade3d / train_diffusion3d / infer_evaluate3d
 configs/base.yaml
@@ -128,4 +141,4 @@ tests/smoke_test.py
 * [MIND](https://doi.org/10.1016/j.media.2012.05.006) — Heinrich et al., Medical Image Analysis 2012
 * [RegGAN](https://arxiv.org/abs/2110.06465) — Kong et al., NeurIPS 2021 (registration-corrected loss)
 * Nyúl, Udupa & Zhang, IEEE TMI 2000 (histogram standardisation)
-* [MONAI](https://monai.io/) `AutoencoderKL`, `DiffusionModelUNet`, `PatchDiscriminator`
+* [MONAI](https://monai.io/) `AutoencoderKL`, `DiffusionModelUNet` (`PatchDiscriminator` only if `adv_weight` > 0)

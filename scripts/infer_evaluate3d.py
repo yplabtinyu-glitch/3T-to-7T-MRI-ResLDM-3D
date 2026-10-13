@@ -1,5 +1,6 @@
 """Synthesise whole 7T volumes for a split and evaluate against the real 7T.
-pipeline per subject: [hist match] -> tiled AE encode -> SPADE -> ResShift sampling (whole latent or tiles) -> tiled decode
+pipeline per subject: [hist match] -> 64^3 patches on a stride-32 grid of the zero-padded volume ->
+  per patch: AE encode -> SPADE -> ResShift (T steps) -> AE decode -> overlapping patches averaged voxel-wise -> unpad
 metrics (on the unpadded volume, [0,1]): SSIM3D (whole / brain), PSNR, MAE, MAE(brain), mean axial 2D SSIM (last axis),
 plus seconds per volume for each stage. Rows for SPADE-only and for the diffusion output (and the AE ceiling with --ceiling).
 usage: python scripts/infer_evaluate3d.py --config configs/base.yaml --ckpt runs/base/diffusion/best.pth"""
@@ -14,9 +15,9 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 
-from mri3d.data import Prepped, hist_match, unpad  # noqa: E402
+from mri3d.data import PatchMerger, Prepped, extract_patches, grid_corners, hist_match, unpad  # noqa: E402
 from mri3d.losses import _gauss1d, ssim3d_map  # noqa: E402
-from mri3d.nets import ae_encode_mu, load_ae, tiled  # noqa: E402
+from mri3d.nets import ae_encode_mu, load_ae  # noqa: E402
 from mri3d.spade3d import SPADEGenerator3D  # noqa: E402
 from mri3d.utils import Timer, autocast, device_of, load_config  # noqa: E402
 
@@ -72,27 +73,55 @@ def main():
     sp.load_state_dict(torch.load(ck["spade_ckpt"], map_location=dev, weights_only=False)["spade"])
     model = build_model(ck["config"], ck["kappa"]).to(dev).eval()
     model.unet.load_state_dict(ck["unet"])
-    scale, C = ck["scale"], cfg["ae"]["latent_channels"]
-    meta_lat = json.load(open(os.path.join(cfg["out_dir"], "latents", "meta.json")))
-    f = meta_lat["factor"]
-    tile, ov = cfg["latent"].get("tile"), cfg["latent"]["overlap"]
+    scale = ck["scale"]
+    P, S, B = cfg["data"]["patch"], ic["stride"], ic["batch"]
+    if ic.get("merge", "mean") != "mean":
+        raise ValueError("only infer.merge: mean is implemented")
     ref = np.load(os.path.join(cfg["data"]["data_dir"], "hist_ref.npz")) if mode != "none" else None
     pr = Prepped(cfg["data"]["data_dir"])
-    print(f"split={split} hist_match={mode} | T={model.T} condition={model.condition} kappa={ck['kappa']} | ckpt epoch {ck['epoch']}")
+    print(f"split={split} hist_match={mode} | T={model.T} condition={model.condition} kappa={ck['kappa']} | "
+          f"patch {P}^3 stride {S} batch {B} merge mean | ckpt epoch {ck['epoch']}")
 
-    enc = lambda x: tiled(lambda t: ae_encode_mu(ae, t).float(), x, tile, ov, 1 / f, C) if tile else ae_encode_mu(ae, x).float()
-    dec = lambda z: tiled(lambda t: ae.decode(t).float(), z, tile // f, ov // f, f, 1) if tile else ae.decode(z).float()
+    def run_patches(vol, want_spade):
+        """vol: padded (D,H,W) numpy in [-1,1] -> merged diffusion (and SPADE-only) volumes in [0,1], stage times"""
+        corners = grid_corners(vol.shape, P, S)
+        x = torch.from_numpy(np.ascontiguousarray(vol))[None].to(dev)          # (1,D,H,W)
+        m_d = PatchMerger(vol.shape, P, dev)
+        m_s = PatchMerger(vol.shape, P, dev) if want_spade else None
+        times = dict.fromkeys(("t_encode", "t_spade", "t_diffusion", "t_decode"), 0.0)
+        g = torch.Generator(device=dev).manual_seed(ic["seed"])
+        torch.manual_seed(ic["seed"])                                             # per-step noise inside sample()
+        for i in range(0, len(corners), B):
+            cb = corners[i:i + B]
+            xb = extract_patches(x, cb, P)                                         # (b,1,P,P,P)
+            with torch.no_grad(), autocast(dev, cfg["bf16"]):
+                with Timer() as tm:
+                    z3 = ae_encode_mu(ae, xb).float()
+                times["t_encode"] += tm.dt
+                with Timer() as tm:
+                    zs = sp(z3, torch.ones(len(cb), dtype=torch.long, device=dev)).float()
+                times["t_spade"] += tm.dt
+                with Timer() as tm:
+                    noise = torch.randn(zs.shape, generator=g, device=dev)
+                    zd = model.sample(zs * scale, model.cond(z3 * scale, zs * scale), noise) / scale
+                times["t_diffusion"] += tm.dt
+                with Timer() as tm:
+                    m_d.add((ae.decode(zd).float() + 1) / 2, cb)
+                times["t_decode"] += tm.dt
+                if m_s is not None:
+                    m_s.add((ae.decode(zs).float() + 1) / 2, cb)
+        times["n_patches"] = len(corners)
+        return m_d.result(), (m_s.result() if m_s is not None else None), times
 
-    def sample(y0, cond):
-        g = torch.Generator(device=y0.device).manual_seed(ic["seed"])
-        noise = torch.randn(y0.shape, generator=g, device=y0.device)
-        lt = ic.get("latent_tile")
-        if not lt:
-            return model.sample(y0, cond, noise)
-        n = len(cond)
-        packed = torch.cat([y0, noise] + cond, 1)
-        fn = lambda p: model.sample(p[:, :C], [p[:, (2 + i) * C:(3 + i) * C] for i in range(n)], p[:, C:2 * C])
-        return tiled(fn, packed, lt, ic["latent_overlap"], 1, C)
+    def ae_ceiling(vol):
+        corners = grid_corners(vol.shape, P, S)
+        x = torch.from_numpy(np.ascontiguousarray(vol))[None].to(dev)
+        m = PatchMerger(vol.shape, P, dev)
+        for i in range(0, len(corners), B):
+            cb = corners[i:i + B]
+            with torch.no_grad(), autocast(dev, cfg["bf16"]):
+                m.add((ae.decode(ae_encode_mu(ae, extract_patches(x, cb, P))).float() + 1) / 2, cb)
+        return m.result()
 
     rows = []
     for s in pr.subjects(split):
@@ -103,23 +132,10 @@ def main():
             v3 = hist_match(v3, ref["lm_3t"], thr)
         if mode == "both":
             v7 = hist_match(v7, ref["lm_7t"], thr)
-        x3 = torch.from_numpy(v3 * 2 - 1)[None, None].to(dev)
-        times = {}
-        with torch.no_grad(), autocast(dev, cfg["bf16"]):
-            with Timer() as tm:
-                z3 = enc(x3)
-            times["t_encode"] = tm.dt
-            with Timer() as tm:
-                zs = sp(z3, torch.ones(1, dtype=torch.long, device=dev)).float()
-            times["t_spade"] = tm.dt
-            with Timer() as tm:
-                zd = sample(zs * scale, model.cond(z3 * scale, zs * scale)) / scale
-            times["t_diffusion"] = tm.dt
-            with Timer() as tm:
-                img_d = (dec(zd) + 1) / 2
-            times["t_decode"] = tm.dt
-            img_s = (dec(zs) + 1) / 2
-            img_c = (dec(enc(torch.from_numpy(v7 * 2 - 1)[None, None].to(dev))) + 1) / 2 if args.ceiling else None
+        img_d, img_s, times = run_patches(v3 * 2 - 1, True)
+        n_patches = times.pop("n_patches")
+        img_d, img_s = img_d[None], img_s[None]
+        img_c = ae_ceiling(v7 * 2 - 1)[None] if args.ceiling else None
         pads = sm["pads"]
         gt = torch.from_numpy(unpad(v7, pads)).to(dev)
         cut = lambda im: torch.from_numpy(unpad(im[0, 0].float().cpu().numpy(), pads)).to(dev)
@@ -129,10 +145,10 @@ def main():
                 continue
             r = {"subject": s, "method": name, **metrics(cut(im), gt, thr)}
             if name == "diffusion":
-                r.update({k: round(v, 3) for k, v in times.items()}, t_total=round(total, 3))
+                r.update({k: round(v, 3) for k, v in times.items()}, t_total=round(total, 3), n_patches=n_patches)
             rows.append(r)
             print(f"  {s} {name:>10}: " + "  ".join(f"{k}={v:.4f}" for k, v in r.items() if isinstance(v, float) and not k.startswith("t_")))
-        print(f"  {s} time: " + "  ".join(f"{k}={v:.2f}s" for k, v in times.items()) + f"  total={total:.2f}s")
+        print(f"  {s} time: " + "  ".join(f"{k}={v:.2f}s" for k, v in times.items()) + f"  total={total:.2f}s  ({n_patches} patches)")
         if ic.get("save_nifti"):
             import nibabel as nib
             aff = nib.load(sm["t7_path"]).affine

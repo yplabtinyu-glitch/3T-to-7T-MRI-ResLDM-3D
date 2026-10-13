@@ -1,10 +1,10 @@
-"""Image-space losses on decoded latent crops (shared by SPADE and diffusion training).
+"""Image-space losses on decoded latent patches (shared by SPADE and diffusion training).
 
   MIND  : structure of D(pred) vs the same-subject 3T, D(z_3T)          (lambda_mind)
   LF    : low-frequency intensity of D(pred) vs a reference D(z_ref)     (lambda_lf; reference = SPADE for diffusion)
   CORR  : RegGAN-style registration-corrected L1 to the 7T, D(z_7T)      (lambda_corr; + smoothness of the displacement)
 All references are decoded without gradient; the prediction is decoded with gradient (decoder weights stay frozen).
-To save memory the losses are computed on a random sub-crop of the latent crop, ignoring `margin` voxels at its border."""
+With `sub_crop: null` (default) the losses use the whole decoded 64³ patch; an int restricts them to a random latent sub-crop. `margin` voxels at the border are ignored."""
 import torch
 import torch.nn as nn
 
